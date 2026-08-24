@@ -12,23 +12,23 @@ import time
 from utils.common import (load_config, html_escape, make_logger,
                      mask_secrets, check_local_response, format_context_lines,
                      format_context_block, smart_truncate, POLL_TIMEOUT_SECONDS,
-                     send_full_context,
+                     send_full_context, send_full_tool,
                      session_tag as common_session_tag)
 from utils.channel import create_channel
 
 _log = make_logger("permission_request")
 
 
-def format_tool_display(tool_name, tool_input):
+def format_tool_display(tool_name, tool_input, limit=300):
     """Clean display of what the tool wants to do. Masks sensitive info.
     Truncates at line/word boundaries so multi-line commands don't show
     a mid-word cut in the middle of an argument."""
     if tool_name == "Bash":
-        text = smart_truncate(tool_input.get("command", str(tool_input)), 300)
+        text = smart_truncate(tool_input.get("command", str(tool_input)), limit)
     elif tool_name in ("Edit", "Write"):
-        text = smart_truncate(tool_input.get("file_path", str(tool_input)), 300)
+        text = smart_truncate(tool_input.get("file_path", str(tool_input)), limit)
     elif tool_name == "WebFetch":
-        text = smart_truncate(tool_input.get("url", str(tool_input)), 300)
+        text = smart_truncate(tool_input.get("url", str(tool_input)), limit)
     elif tool_name in ("EnterPlanMode", "ExitPlanMode"):
         return ""
     elif tool_name == "AskUserQuestion":
@@ -36,7 +36,7 @@ def format_tool_display(tool_name, tool_input):
         return questions[0].get("question", "") if questions else ""
     else:
         raw = json.dumps(tool_input, ensure_ascii=False)
-        text = smart_truncate(raw, 300) if raw != "{}" else ""
+        text = smart_truncate(raw, limit) if raw != "{}" else ""
     return mask_secrets(text)
 
 
@@ -92,7 +92,7 @@ def build_ask_user_question_message(ch, tool_input, context_lines, session_tag="
         f"{multi_hint}"
         f"{context_text}"
     )
-    text = smart_truncate(text, 4000, marker="\n\n<i>…truncated</i>")
+    text = smart_truncate(text, 4090, marker="\n\n<i>…truncated</i>")
 
     buttons = _build_question_keyboard(options, multi, selected=set(), show_more=show_more)
     msg_id = ch.send_message(text, buttons=buttons)
@@ -235,7 +235,7 @@ def send_approval_message(ch, tool_name, tool_display, context_lines, permission
         f"{cmd_block}"
         f"{context_text}"
     )
-    text = smart_truncate(text, 4000, marker="\n\n<i>…truncated</i>")
+    text = smart_truncate(text, 4090, marker="\n\n<i>…truncated</i>")
     return ch.send_message(text, buttons=build_approval_buttons(permission_suggestions, show_more=show_more))
 
 
@@ -392,7 +392,7 @@ def main():
     tool_name = event.get("tool_name", "?")
     tool_input = event.get("tool_input", {})
     transcript_path = event.get("transcript_path", "")
-    tool_display = format_tool_display(tool_name, tool_input)
+    tool_display = format_tool_display(tool_name, tool_input, limit=cfg["tool_display_max_chars"])
     session_tag = common_session_tag(event)
 
     state["ch"] = ch
@@ -485,7 +485,7 @@ def main():
             msg_id = send_approval_message(
                 ch, tool_name, tool_display, context_lines,
                 permission_suggestions, session_tag=session_tag,
-                show_more=bool(transcript_path) and cfg["context_turns"] > 0)
+                show_more=True)
             state["msg_id"] = msg_id
             _log(f"SENT msg_id={msg_id}")
         except Exception as e:
@@ -494,7 +494,9 @@ def main():
 
         def _on_more():
             _log("User clicked More")
-            sent, total = send_full_context(ch, msg_id, transcript_path, cfg["context_turns"])
+            tool_sent, tool_total = send_full_tool(ch, msg_id, tool_name, tool_input)
+            ctx_sent, ctx_total = send_full_context(ch, msg_id, transcript_path, cfg["context_turns"])
+            sent, total = tool_sent + ctx_sent, tool_total + ctx_total
             if sent == total:  # includes 0==0 — nothing to show, drop button
                 if total == 0:
                     _log("No full context to expand")

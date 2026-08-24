@@ -35,6 +35,11 @@ cc-remote-approval/
 │   └── telegram/
 │       ├── client.py            # TelegramChannel + tg_request API
 │       └── poll.py              # getUpdates coordination (flock + pending queue)
+├── mcp/
+│   └── permission_prompt_server.py  # Claude Code --permission-prompt-tool MCP
+│                                     # server — headless (`claude -p`) equivalent
+│                                     # of the PermissionRequest hook, since that
+│                                     # hook never fires without a TTY
 ├── skills/
 │   ├── setup/
 │   │   └── SKILL.md         # /cc-remote-approval:setup interactive configuration
@@ -87,6 +92,7 @@ create_channel(cfg) reads cfg["channel_type"] and returns the right implementati
 | `utils/channel.py` | Channel interface + factory. Hooks call `ch.send_message()`, `ch.poll()`, `ch.edit_message()` |
 | `channels/telegram/client.py` | TelegramChannel: Bot API via urllib, token in-process |
 | `channels/telegram/poll.py` | Coordinated getUpdates: flock + pending.json queue (5-min TTL) for concurrent hooks |
+| `mcp/permission_prompt_server.py` | MCP server for Claude Code's `--permission-prompt-tool` (only works with `-p`/print mode). Stdio, newline-delimited JSON-RPC 2.0. Exposes one tool (`approve`) that Claude calls directly — not a hook — with `{tool_name, input, tool_use_id}` (empirically confirmed; undocumented upstream) and must return `{"behavior": "allow"}` or `{"behavior": "deny", "message": "..."}` as the tool result text. Reuses `send_approval_message`/`poll_callback`/`edit_message_resolved` from `hooks/permission_request.py` so both paths render identical Telegram messages. |
 
 ## Configuration
 
@@ -103,6 +109,7 @@ All hooks read from `~/.cc-remote-approval/config.json`:
   "stop_wait_seconds": 180,
   "context_turns": 3,
   "context_max_chars": 200,
+  "tool_display_max_chars": 1500,
   "session_hint_enabled": true
 }
 ```
@@ -251,6 +258,7 @@ Things that aren't obvious from reading the code — invariants, external constr
 6. **Text replies require quote-reply anchoring** — `poll.py` routes incoming text by `reply_to_message.message_id`. Bare text is dropped so concurrent hooks don't steal each other's replies. `send_reply_prompt` uses Telegram's `ForceReply` to make quoting automatic (works in notification quick-reply, Apple Watch, etc.).
 7. **No end-of-turn question detection** — Claude Code doesn't expose a "this turn was a question" signal, and heuristic regex detection proved too fragile. We steer the model toward the `AskUserQuestion` tool via `SessionStart additionalContext` instead. The Stop hook's `{decision: block, reason}` mechanism is for **user-driven** remote continuation (user taps Continue) — different use case from auto-question-detection.
 8. **ESC in Claude Code sends SIGKILL to hooks** — cancelling a pending permission/question locally kills the polling hook with an uncatchable signal, so the channel message keeps its buttons until the user resolves it on the channel.
+9. **`PermissionRequest` never fires in headless (`-p`/print) mode** — confirmed empirically (no `permission_request.log` entry is ever written for a gated tool call under `-p`, while `session_start.log`/`stop.log` fire normally in the same run). Headless mode has no interactive dialog to run the hook "alongside", so Claude Code auto-denies gated tools and explains itself in text instead of invoking the hook at all. `mcp/permission_prompt_server.py` is the fix for this case — see its row above — but it only engages when a run explicitly passes `--permission-prompt-tool mcp__approval__approve`; there's no way to make headless approval the default without that flag on every invocation.
 
 ## Adding a New Channel
 

@@ -25,6 +25,7 @@ DEFAULTS = {
     "elicitation_timeout": 60,
     "context_turns": 3,
     "context_max_chars": 200,
+    "tool_display_max_chars": 1500,
     "stop_hook_enabled": False,
     "stop_wait_seconds": 180,
     "session_hint_enabled": True,
@@ -385,6 +386,62 @@ def build_full_context_chunks(transcript_path, max_turns=3, chunk_limit=3900):
     if current:
         chunks.append(current)
     return chunks
+
+
+def build_full_tool_chunks(tool_name, tool_input, chunk_limit=3900):
+    """Return the full (untruncated) tool payload as HTML-safe <pre> chunks —
+    companion to build_full_context_chunks, but for the tool call itself
+    rather than conversation turns. format_tool_display() only ever shows a
+    preview capped at tool_display_max_chars; this is what the 'Full
+    context' button expands to for long Bash commands / Edit diffs / Write
+    content that got cut off there."""
+    if tool_name == "Bash":
+        raw = tool_input.get("command", "")
+        label = "Full command"
+    elif tool_name == "Write":
+        raw = f"{tool_input.get('file_path', '')}\n\n{tool_input.get('content', '')}"
+        label = "Full file content"
+    elif tool_name == "Edit":
+        old = tool_input.get("old_string", "")
+        new = tool_input.get("new_string", "")
+        raw = (f"{tool_input.get('file_path', '')}\n\n"
+               f"--- old ---\n{old}\n\n--- new ---\n{new}")
+        label = "Full edit"
+    elif tool_name in ("EnterPlanMode", "ExitPlanMode", "AskUserQuestion"):
+        return []  # these tools render their own dedicated messages, not a codeblock
+    else:
+        raw = json.dumps(tool_input, ensure_ascii=False, indent=2)
+        label = "Full input"
+
+    raw = raw.strip()
+    if not raw:
+        return []
+    raw = mask_secrets(raw)
+
+    header = f"📄 <b>{label}</b>\n┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n"
+    body_limit = chunk_limit - len(header) - 40
+    parts = _split_escaped_at_boundaries(raw, body_limit)
+    total = len(parts)
+    chunks = []
+    for i, p in enumerate(parts, start=1):
+        suffix = f" <i>(part {i}/{total})</i>" if total > 1 else ""
+        chunks.append(f"{header}{suffix}\n<pre>{p}</pre>")
+    return chunks
+
+
+def send_full_tool(ch, reply_to_msg_id, tool_name, tool_input):
+    """Send the full untruncated tool payload as reply-anchored messages.
+    Companion to send_full_context — called alongside it from the same
+    'Full context' button handler so long commands/diffs/content aren't
+    stuck at the codeblock preview limit.
+
+    Returns (sent_count, total_count), same contract as send_full_context."""
+    chunks = build_full_tool_chunks(tool_name, tool_input)
+    sent = 0
+    for chunk in chunks:
+        if ch.send_reply(reply_to_msg_id, chunk):
+            sent += 1
+    return sent, len(chunks)
 
 
 MAX_LOG_SIZE = 1024 * 1024  # 1 MB
