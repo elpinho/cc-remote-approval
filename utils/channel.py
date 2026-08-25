@@ -31,6 +31,21 @@ class Channel:
         """Send a message with optional inline buttons. Returns message ID."""
         raise NotImplementedError
 
+    def send_photo(self, photo_url, caption="", buttons=None, parse_mode="HTML"):
+        """Send a photo (by URL) with an optional caption and inline buttons.
+        Returns message ID. Same failure contract as send_message — propagate
+        transport errors, let the caller decide.
+
+        Channels without native photo support should degrade to
+        send_message(caption + '\\n' + photo_url, buttons=buttons)."""
+        raise NotImplementedError
+
+    def edit_caption(self, msg_id, caption, buttons=None, parse_mode="HTML"):
+        """Edit a photo message's caption/buttons. Silently ignores errors,
+        same contract as edit_message. No-op default for channels that
+        don't support send_photo."""
+        pass
+
     def edit_message(self, msg_id, text, buttons=None, parse_mode="HTML"):
         """Edit an existing message. Silently ignores errors."""
         raise NotImplementedError

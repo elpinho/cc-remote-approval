@@ -72,6 +72,30 @@ class TelegramChannel(Channel):
         except Exception:
             pass
 
+    def send_photo(self, photo_url, caption="", buttons=None, parse_mode="HTML"):
+        """Send a photo by URL with an optional caption and inline buttons.
+        Same error-propagation contract as send_message — the caller decides
+        whether to log and bail out on failure."""
+        data = {"chat_id": self.chat_id, "photo": photo_url,
+                "caption": caption, "parse_mode": parse_mode}
+        if buttons:
+            data["reply_markup"] = {"inline_keyboard": buttons}
+        result = self._send("sendPhoto", data)
+        return result["result"]["message_id"]
+
+    def edit_caption(self, msg_id, caption, buttons=None, parse_mode="HTML"):
+        """Edit a photo message's caption/buttons. Fire-and-forget, same
+        contract as edit_message — resolve-time edits shouldn't crash the
+        caller."""
+        data = {"chat_id": self.chat_id, "message_id": msg_id,
+                "caption": caption, "parse_mode": parse_mode}
+        if buttons is not None:
+            data["reply_markup"] = {"inline_keyboard": buttons}
+        try:
+            self._send("editMessageCaption", data)
+        except Exception:
+            pass
+
     def edit_buttons(self, msg_id, buttons):
         try:
             self._send("editMessageReplyMarkup", {

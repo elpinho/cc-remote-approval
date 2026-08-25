@@ -212,6 +212,220 @@ def poll_question_answer(ch, message_id, options, multi=False, transcript_path="
     return "timeout", None
 
 
+def _prop_text(value):
+    """Flatten a Notion-MCP property value (string / list / dict) to display
+    text. Tolerant of both the flat simplified schema this hook expects and
+    the nested Notion REST shape, in case a server sends the latter."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return ", ".join(_prop_text(v) for v in value)
+    if isinstance(value, dict):
+        return value.get("url") or value.get("name") or json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _first_present(d, *keys):
+    for k in keys:
+        v = d.get(k)
+        if v:
+            return v
+    return None
+
+
+def classify_notion_write(tool_name, tool_input):
+    """Best-effort, project-agnostic classification of a Notion MCP write so
+    it can get a richer approval message (and a Retry option) instead of the
+    generic JSON dump. Detection is shape-based (property names) only — never
+    tied to a specific page/database ID — so it holds across projects and
+    degrades to None (generic handling) on any schema mismatch.
+
+    Returns one of "character_proposal", "status_decision", "image_ready",
+    "content_edit", or None."""
+    if tool_name.endswith("notion-create-pages"):
+        pages = tool_input.get("pages") or []
+        if pages:
+            props = pages[0].get("properties", {}) or {}
+            hits = sum(1 for k in ("Name", "Title", "Creature type", "Region",
+                                    "Personality traits", "Type") if k in props)
+            if hits >= 2:
+                return "character_proposal"
+        return None
+
+    if tool_name.endswith("notion-update-page"):
+        props = tool_input.get("properties") or {}
+        if _first_present(props, "Image", "Cover", "Image URL"):
+            return "image_ready"
+        if "Status" in props:
+            return "status_decision"
+        if _first_present(tool_input, "command", "content", "children", "markdown"):
+            return "content_edit"
+        return None
+
+    return None
+
+
+def _rationale_from_transcript(transcript_path, max_chars=3000):
+    """Full text of the subagent's own immediately-preceding message, when a
+    transcript is available. Every subagent is required (by project
+    convention) to state its rationale before a gated write, so this is a
+    better approval preview than the raw tool_input alone.
+
+    Only available on the interactive hook path — the headless MCP
+    permission-prompt server never gets a transcript_path, so it relies on
+    tool_input fields alone via build_notion_decision_message()."""
+    if not transcript_path:
+        return ""
+    msgs = extract_last_messages(transcript_path, max_messages=1, max_chars=None, full_scan=True)
+    if not msgs or msgs[-1]["role"] != "assistant":
+        return ""
+    return smart_truncate(mask_secrets(msgs[-1]["text"]), max_chars)
+
+
+def build_notion_decision_message(kind, tool_input, rationale="", session_tag=""):
+    """Render a readable approval preview (+ optional image URL) for a
+    classified Notion write. Falls back gracefully — never raises — since a
+    schema mismatch should degrade to a plainer message, not a crash."""
+    tag = f" · <code>{html_escape(session_tag)}</code>" if session_tag else ""
+    rationale_block = f"\n\n{html_escape(rationale)}" if rationale else ""
+
+    if kind == "character_proposal":
+        props = (tool_input.get("pages") or [{}])[0].get("properties", {}) or {}
+        name = _prop_text(_first_present(props, "Name", "Title") or "a new character")
+        details = "\n".join(
+            f"  • <b>{html_escape(k)}:</b> {html_escape(_prop_text(v))}"
+            for k, v in props.items() if k not in ("Name", "Title") and v)
+        details_block = f"\n\n{details}" if details and not rationale else ""
+        header = f"🐾 <b>New character proposed: {html_escape(name)}</b>{tag}"
+        return header + rationale_block + details_block, None
+
+    if kind == "status_decision":
+        props = tool_input.get("properties") or {}
+        status = _prop_text(_first_present(props, "Status") or "?")
+        header = f"📋 <b>Status change requested → {html_escape(status)}</b>{tag}"
+        return header + rationale_block, None
+
+    if kind == "image_ready":
+        props = tool_input.get("properties") or {}
+        image_val = _first_present(props, "Image", "Cover", "Image URL")
+        image_url = image_val if isinstance(image_val, str) else _prop_text(image_val)
+        status = props.get("Status")
+        status_line = f"\n\n<b>Status →</b> {html_escape(_prop_text(status))}" if status else ""
+        header = f"🎨 <b>Character image ready</b>{tag}"
+        text = header + rationale_block + status_line
+        is_url = isinstance(image_url, str) and image_url.startswith("http")
+        return text, (image_url if is_url else None)
+
+    if kind == "content_edit":
+        body = _first_present(tool_input, "command", "content", "markdown", "children")
+        body_text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False, indent=2)
+        header = f"📖 <b>Lore update proposed</b>{tag}"
+        body_block = (f"\n\n{html_escape(smart_truncate(body_text, 2500))}"
+                      if body_text and not rationale else "")
+        return header + rationale_block + body_block, None
+
+    return None, None
+
+
+def build_decision_buttons(show_more=True):
+    """Approve / Retry / Cancel — used for classified Notion decision gates
+    instead of the generic Allow/Always/Deny row. Retry maps to a Deny with a
+    machine-readable RETRY: message, so the subagent can distinguish 'revise
+    and re-attempt once' from an outright Cancel."""
+    rows = [[
+        {"text": "✅ Approve", "callback_data": "allow"},
+        {"text": "🔁 Retry", "callback_data": "retry"},
+        {"text": "❌ Cancel", "callback_data": "deny"},
+    ]]
+    if show_more:
+        rows.append([{"text": "📖 Full context", "callback_data": "more"}])
+    return rows
+
+
+RETRY_MESSAGE = (
+    "RETRY: Reviewer requested a revision via Telegram. Make one focused "
+    "revision informed by this and re-attempt the same write as a real tool "
+    "call right away — do not ask for approval in chat. Do not retry a "
+    "second time if this is denied again this run."
+)
+CANCEL_MESSAGE = (
+    "CANCEL: Reviewer rejected this via Telegram. Leave status/state exactly "
+    "as it was and stop — do not retry."
+)
+
+_DECISION_SHORT_LABELS = {
+    "character_proposal": "New character proposal",
+    "status_decision": "Status change",
+    "image_ready": "Character image",
+    "content_edit": "Lore update",
+}
+
+
+def handle_notion_decision(ch, state, kind, tool_name, tool_input,
+                           transcript_path, poll_start_size, session_tag, cfg):
+    """Shared by the interactive hook (main(), below) and the headless MCP
+    permission-prompt server: sends the classified rich preview (text or
+    photo), polls for allow/retry/deny, and returns either:
+      - a decision dict: {"behavior": "allow"} or {"behavior": "deny", "message": ...}
+      - the string "local" (interactive-only: user responded in the terminal)
+      - None (send failed — caller decides how to fail closed/open)
+    """
+    rationale = _rationale_from_transcript(transcript_path)
+    text, image_url = build_notion_decision_message(kind, tool_input, rationale, session_tag)
+    text = smart_truncate(text, 4090, marker="\n\n<i>…truncated</i>")
+    show_more = bool(transcript_path) and cfg.get("context_turns", 3) > 0
+    is_photo = bool(image_url)
+    buttons = build_decision_buttons(show_more=show_more)
+    short_label = _DECISION_SHORT_LABELS.get(kind, tool_name)
+
+    try:
+        if is_photo:
+            msg_id = ch.send_photo(image_url, caption=text, buttons=buttons)
+        else:
+            msg_id = ch.send_message(text, buttons=buttons)
+        state["msg_id"] = msg_id
+        state["is_photo"] = is_photo
+        state["tool_display"] = short_label
+        _log(f"SENT notion-decision({kind}) msg_id={msg_id} photo={is_photo}")
+    except Exception as e:
+        _log(f"SEND FAILED: {e}")
+        return None
+
+    def _on_more():
+        _log("User clicked More")
+        sent, total = send_full_context(ch, msg_id, transcript_path, cfg.get("context_turns", 3))
+        if sent == total:
+            if total == 0:
+                _log("No full context to expand")
+            ch.edit_buttons(msg_id, build_decision_buttons(show_more=False))
+            return True
+        return False
+
+    answer = poll_callback(ch, msg_id, transcript_path, poll_start_size, on_more=_on_more)
+    state["resolved"] = True
+
+    if answer == "local":
+        edit_message_resolved(ch, msg_id, "local", tool_name, short_label, is_photo=is_photo)
+        return "local"
+    if answer == "timeout":
+        _log("Telegram timeout, no response")
+        edit_message_resolved(ch, msg_id, "timeout", tool_name, short_label, is_photo=is_photo)
+        return {"behavior": "deny", "message": "Approval request timed out"}
+    if answer == "allow":
+        edit_message_resolved(ch, msg_id, "allow", tool_name, short_label, is_photo=is_photo,
+                              label_overrides={"allow": "Approved"})
+        return {"behavior": "allow"}
+    if answer == "retry":
+        edit_message_resolved(ch, msg_id, "retry", tool_name, short_label, is_photo=is_photo)
+        return {"behavior": "deny", "message": RETRY_MESSAGE}
+    if answer == "deny":
+        edit_message_resolved(ch, msg_id, "deny", tool_name, short_label, is_photo=is_photo,
+                              label_overrides={"deny": "Cancelled"})
+        return {"behavior": "deny", "message": CANCEL_MESSAGE}
+    edit_message_resolved(ch, msg_id, "expired", tool_name, short_label, is_photo=is_photo)
+    return {"behavior": "deny", "message": "Approval request expired"}
+
+
 def build_approval_buttons(permission_suggestions=None, show_more=True):
     """Assemble inline-keyboard rows for an approval message. Separate
     helper so we can rebuild without More after the user taps it."""
@@ -276,10 +490,21 @@ def poll_callback(ch, message_id, transcript_path="", poll_start_size=0,
     return "timeout"
 
 
-def edit_message_resolved(ch, message_id, status, tool_name, tool_display):
-    """Edit message after resolution — just icon + title + command, clean and short."""
-    icons = {"allow": "✅", "always": "✅", "deny": "❌", "timeout": "⏰", "local": "🖥", "expired": "💤"}
-    labels = {"allow": "Allowed", "always": "Always allowed", "deny": "Denied", "timeout": "Timeout", "local": "Handled locally", "expired": "Session ended"}
+def edit_message_resolved(ch, message_id, status, tool_name, tool_display,
+                          is_photo=False, label_overrides=None):
+    """Edit message after resolution — just icon + title + command, clean and short.
+
+    is_photo: route the edit through edit_caption instead of edit_message —
+    Telegram requires editMessageCaption for messages sent via sendPhoto.
+    label_overrides: per-call label overrides (e.g. rich Notion decisions use
+    "Approved"/"Cancelled" instead of the generic "Allowed"/"Denied")."""
+    icons = {"allow": "✅", "always": "✅", "deny": "❌", "retry": "🔁",
+             "timeout": "⏰", "local": "🖥", "expired": "💤"}
+    labels = {"allow": "Allowed", "always": "Always allowed", "deny": "Denied",
+              "retry": "Retry requested", "timeout": "Timeout",
+              "local": "Handled locally", "expired": "Session ended"}
+    if label_overrides:
+        labels = {**labels, **label_overrides}
     icon = icons.get(status, "✅")
     label = labels.get(status, status)
 
@@ -292,7 +517,10 @@ def edit_message_resolved(ch, message_id, status, tool_name, tool_display):
     # buttons=[] clears the inline keyboard so users can't tap Allow/Deny
     # on an already-resolved message (callback would land in pending and
     # TTL-expire silently).
-    ch.edit_message(message_id, text, buttons=[])
+    if is_photo:
+        ch.edit_caption(message_id, text, buttons=[])
+    else:
+        ch.edit_message(message_id, text, buttons=[])
 
 
 
@@ -327,7 +555,7 @@ def main():
     # branch. Deleted on any exit path so TG users don't see a dangling
     # "Reply to this message" lock on an already-resolved request.
     state = {"ch": None, "msg_id": None, "tool_name": "", "tool_display": "",
-             "resolved": False, "prompt_ids": []}
+             "resolved": False, "prompt_ids": [], "is_photo": False}
 
     def _cleanup_prompts():
         if not state["ch"]:
@@ -348,6 +576,7 @@ def main():
             edit_message_resolved(
                 state["ch"], state["msg_id"],
                 status, state["tool_name"], state["tool_display"],
+                is_photo=state.get("is_photo", False),
             )
         _cleanup_prompts()
         sys.exit(0)
@@ -360,6 +589,7 @@ def main():
             edit_message_resolved(
                 state["ch"], state["msg_id"],
                 "expired", state["tool_name"], state["tool_display"],
+                is_photo=state.get("is_photo", False),
             )
         _cleanup_prompts()
 
@@ -430,6 +660,8 @@ def main():
     # Phase 2 & 3: depends on tool type
     _log(f"ESCALATING: {tool_name} / {tool_display[:50]}")
 
+    notion_kind = classify_notion_write(tool_name, tool_input)
+
     if tool_name == "AskUserQuestion":
         try:
             msg_id, question_text, options, multi = build_ask_user_question_message(
@@ -478,6 +710,16 @@ def main():
             edit_message_resolved(ch, msg_id, "expired", tool_name, question_text or tool_display)
             _cleanup_prompts()
             sys.exit(0)
+
+    elif notion_kind:
+        result = handle_notion_decision(ch, state, notion_kind, tool_name, tool_input,
+                                        transcript_path, poll_start_size, session_tag, cfg)
+        if result is None or result == "local":
+            sys.exit(0)
+        if result.get("behavior") == "allow":
+            respond_allow()
+        else:
+            respond_deny(result.get("message", ""))
 
     else:
         permission_suggestions = event.get("permission_suggestions")

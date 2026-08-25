@@ -92,7 +92,27 @@ create_channel(cfg) reads cfg["channel_type"] and returns the right implementati
 | `utils/channel.py` | Channel interface + factory. Hooks call `ch.send_message()`, `ch.poll()`, `ch.edit_message()` |
 | `channels/telegram/client.py` | TelegramChannel: Bot API via urllib, token in-process |
 | `channels/telegram/poll.py` | Coordinated getUpdates: flock + pending.json queue (5-min TTL) for concurrent hooks |
-| `mcp/permission_prompt_server.py` | MCP server for Claude Code's `--permission-prompt-tool` (only works with `-p`/print mode). Stdio, newline-delimited JSON-RPC 2.0. Exposes one tool (`approve`) that Claude calls directly — not a hook — with `{tool_name, input, tool_use_id}` (empirically confirmed; undocumented upstream) and must return `{"behavior": "allow"}` or `{"behavior": "deny", "message": "..."}` as the tool result text. Reuses `send_approval_message`/`poll_callback`/`edit_message_resolved` from `hooks/permission_request.py` so both paths render identical Telegram messages. |
+| `mcp/permission_prompt_server.py` | MCP server for Claude Code's `--permission-prompt-tool` (only works with `-p`/print mode). Stdio, newline-delimited JSON-RPC 2.0. Exposes one tool (`approve`) that Claude calls directly — not a hook — with `{tool_name, input, tool_use_id}` (empirically confirmed; undocumented upstream) and must return `{"behavior": "allow"}` or `{"behavior": "deny", "message": "..."}` as the tool result text. Reuses `send_approval_message`/`poll_callback`/`edit_message_resolved` from `hooks/permission_request.py` so both paths render identical Telegram messages. Also reuses `classify_notion_write`/`handle_notion_decision` for the rich Notion previews below — this is the path that actually renders them in production, since headless mode never gets a transcript. |
+
+### Rich Notion decision previews (Approve / Retry / Cancel)
+
+`hooks/permission_request.py` adds a second message style, shared by both the
+interactive hook and the headless MCP server above, for tool calls that look like
+a Notion MCP write with a recognizable shape:
+
+| Function | Role |
+|---|---|
+| `classify_notion_write(tool_name, tool_input)` | Shape-based classifier — `notion-create-pages` with ≥2 character-brief-like properties → `"character_proposal"`; `notion-update-page` with an `Image` property → `"image_ready"`; with a `Status` property (no `Image`) → `"status_decision"`; with `content`/`command`/`children` (no `Status`/`Image`) → `"content_edit"`; else `None` (generic handling, unchanged). **Never matches on a page/database ID** — this stays a general plugin capability, not something tied to any one project's Notion schema. |
+| `build_notion_decision_message(kind, tool_input, rationale, session_tag)` | Renders the preview text (and, for `"image_ready"` with a URL-shaped `Image` value, an image URL to send as a photo instead of a text message). Falls back to a plainer render — never raises — if expected fields aren't where the classifier expects them. |
+| `_rationale_from_transcript(transcript_path)` | Full text of the calling agent's last message, when a transcript is available (interactive hook only — the headless MCP path always calls with `transcript_path=""`, so its previews rely on `tool_input` fields alone). |
+| `build_decision_buttons()` | Approve / 🔁 Retry / ❌ Cancel, replacing the generic Allow/Always/Deny row for classified calls. |
+| `handle_notion_decision(...)` | Shared send-poll-resolve flow. Approve → `{"behavior": "allow"}`. Retry → deny with a message prefixed `RETRY:` (a machine-readable marker the calling agent's own instructions are expected to parse — this plugin doesn't know or care what "retry" means to the caller). Cancel/timeout/expired → deny with a message prefixed `CANCEL:` or a plain reason. |
+
+This is deliberately schema-tolerant, not schema-authoritative: it's built against
+the *simplified* Notion MCP tool shape (flat `properties` dict, plain-string
+`content`/`command`), degrades to the generic JSON-dump preview on any mismatch,
+and never blocks the underlying write — it only changes what the Telegram message
+looks like and what a denial's message contains.
 
 ## Configuration
 

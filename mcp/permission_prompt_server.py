@@ -33,6 +33,7 @@ from permission_request import (  # noqa: E402
     format_tool_display, send_approval_message, poll_callback,
     edit_message_resolved, build_ask_user_question_message,
     poll_question_answer, build_approval_buttons,
+    classify_notion_write, handle_notion_decision,
 )
 from utils.common import send_full_tool  # noqa: E402
 
@@ -139,6 +140,24 @@ def _decide(args):
 
     if tool_name == "AskUserQuestion":
         return _decide_ask_user_question(ch, tool_name, tool_input)
+
+    notion_kind = classify_notion_write(tool_name, tool_input)
+    if notion_kind:
+        # No transcript in headless mode — handle_notion_decision falls
+        # back to tool_input fields alone for the message body. `state` is
+        # just bookkeeping here (no signal handlers to feed, unlike the
+        # interactive hook's main()).
+        state = {"ch": ch, "msg_id": None, "tool_name": tool_name,
+                 "tool_display": "", "resolved": False, "prompt_ids": [],
+                 "is_photo": False}
+        result = handle_notion_decision(ch, state, notion_kind, tool_name, tool_input,
+                                        transcript_path="", poll_start_size=0,
+                                        session_tag="headless", cfg=cfg)
+        if result is None:
+            return {"behavior": "deny", "message": "Failed to reach Telegram"}
+        if result == "local":
+            return {"behavior": "deny", "message": "Unexpected local response in headless mode"}
+        return result
 
     tool_display = format_tool_display(tool_name, tool_input, limit=cfg["tool_display_max_chars"])
 
