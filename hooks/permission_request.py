@@ -213,52 +213,154 @@ def poll_question_answer(ch, message_id, options, multi=False, transcript_path="
 
 
 def _prop_text(value):
-    """Flatten a Notion-MCP property value (string / list / dict) to display
-    text. Tolerant of both the flat simplified schema this hook expects and
-    the nested Notion REST shape, in case a server sends the latter."""
+    """Flatten a Notion property value to display text. Tolerant of the flat
+    simplified schema this hook was originally built against AND the nested
+    Notion REST shape ({"type": "status", "status": {"name": "..."}}, rich
+    text arrays, file objects, etc.) — the exact --permission-prompt-tool /
+    MCP wire format isn't documented, so this degrades gracefully instead of
+    assuming one shape."""
+    if value is None:
+        return ""
     if isinstance(value, str):
         return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
     if isinstance(value, list):
-        return ", ".join(_prop_text(v) for v in value)
+        parts = [_prop_text(v) for v in value]
+        return ", ".join(p for p in parts if p)
     if isinstance(value, dict):
-        return value.get("url") or value.get("name") or json.dumps(value, ensure_ascii=False)
+        t = value.get("type")
+        if isinstance(t, str) and t in value:
+            return _prop_text(value[t])
+        for key in ("plain_text", "name", "url"):
+            if isinstance(value.get(key), str) and value[key]:
+                return value[key]
+        for key in ("external", "file"):
+            if key in value:
+                nested = _prop_text(value[key])
+                if nested:
+                    return nested
+        for v in value.values():
+            nested = _prop_text(v)
+            if nested:
+                return nested
+        return json.dumps(value, ensure_ascii=False)
     return str(value)
 
 
-def _first_present(d, *keys):
-    for k in keys:
-        v = d.get(k)
-        if v:
+def _extract_url(value):
+    """Best-effort URL extraction from a property value — prioritizes an
+    actual URL over a display name (unlike _prop_text), since callers use
+    this specifically to find an image to render as a Telegram photo.
+    Tolerant of a plain string, a list of file objects, or Notion REST's
+    nested {"type": "files", "files": [{"external": {"url": ...}}]} shape."""
+    if isinstance(value, str):
+        return value if value.startswith("http") else None
+    if isinstance(value, list):
+        for v in value:
+            u = _extract_url(v)
+            if u:
+                return u
+        return None
+    if isinstance(value, dict):
+        if isinstance(value.get("url"), str):
+            return value["url"]
+        for key in ("external", "file"):
+            if key in value:
+                u = _extract_url(value[key])
+                if u:
+                    return u
+        t = value.get("type")
+        if isinstance(t, str) and t in value:
+            return _extract_url(value[t])
+        return None
+    return None
+
+
+def _get_ci(d, *keys):
+    """Case-insensitive, multi-key lookup. Returns the first non-empty match
+    or None. Property naming conventions vary across Notion MCP server
+    versions/wire formats (e.g. "Image" vs "image" vs "Image URL")."""
+    if not isinstance(d, dict):
+        return None
+    lower_map = {}
+    for k, v in d.items():
+        if isinstance(k, str):
+            lower_map.setdefault(k.lower(), v)
+    for key in keys:
+        v = lower_map.get(key.lower())
+        if v not in (None, "", [], {}):
             return v
     return None
+
+
+def _extract_properties(tool_input):
+    """Best-effort properties-dict extraction, tolerant of several plausible
+    Notion MCP payload shapes — the exact wire format for
+    --permission-prompt-tool / MCP tool_input isn't publicly documented."""
+    if not isinstance(tool_input, dict):
+        return {}
+    for key in ("properties", "property_values"):
+        v = tool_input.get(key)
+        if isinstance(v, dict) and v:
+            return v
+    for key in ("pages", "children"):
+        v = tool_input.get(key)
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            inner = _extract_properties(v[0])
+            if inner:
+                return inner
+    page = tool_input.get("page")
+    if isinstance(page, dict):
+        inner = _extract_properties(page)
+        if inner:
+            return inner
+    return {}
+
+
+# Property names (lowercased) that look like a FandomFusionWear-style
+# character brief. Used as a shape hint, not a hard schema — see
+# classify_notion_write(). Generic on purpose: any project pairing a
+# "create a titled record with a couple of descriptive fields" call through
+# this plugin gets the same treatment.
+_CHARACTER_KEY_HINTS = {"name", "title", "creature type", "region",
+                        "personality traits", "type"}
 
 
 def classify_notion_write(tool_name, tool_input):
     """Best-effort, project-agnostic classification of a Notion MCP write so
     it can get a richer approval message (and a Retry option) instead of the
-    generic JSON dump. Detection is shape-based (property names) only — never
-    tied to a specific page/database ID — so it holds across projects and
-    degrades to None (generic handling) on any schema mismatch.
+    generic JSON dump. Detection is shape-based only — never tied to a
+    specific page/database ID — so it holds across projects and degrades to
+    None (generic handling) on any schema mismatch.
+
+    Deliberately tolerant of multiple plausible property/content locations
+    (see _extract_properties / _get_ci) because the exact
+    --permission-prompt-tool wire format is undocumented upstream, and even
+    the interactive-hook tool_input shape for a given Notion MCP server
+    build isn't guaranteed to match what this was written against.
 
     Returns one of "character_proposal", "status_decision", "image_ready",
     "content_edit", or None."""
-    if tool_name.endswith("notion-create-pages"):
-        pages = tool_input.get("pages") or []
-        if pages:
-            props = pages[0].get("properties", {}) or {}
-            hits = sum(1 for k in ("Name", "Title", "Creature type", "Region",
-                                    "Personality traits", "Type") if k in props)
-            if hits >= 2:
-                return "character_proposal"
+    if not isinstance(tool_input, dict) or not isinstance(tool_name, str):
         return None
 
-    if tool_name.endswith("notion-update-page"):
-        props = tool_input.get("properties") or {}
-        if _first_present(props, "Image", "Cover", "Image URL"):
+    if tool_name.endswith("create-pages"):
+        props = _extract_properties(tool_input) or tool_input
+        hits = sum(1 for k in props
+                  if isinstance(k, str) and k.lower() in _CHARACTER_KEY_HINTS)
+        if hits >= 2:
+            return "character_proposal"
+        return None
+
+    if tool_name.endswith("update-page"):
+        props = _extract_properties(tool_input) or tool_input
+        if _get_ci(props, "Image", "Cover", "Image URL", "Files") is not None:
             return "image_ready"
-        if "Status" in props:
+        if _get_ci(props, "Status") is not None:
             return "status_decision"
-        if _first_present(tool_input, "command", "content", "children", "markdown"):
+        if _get_ci(tool_input, "command", "content", "children", "markdown",
+                   "body", "page_content") is not None:
             return "content_edit"
         return None
 
@@ -290,34 +392,35 @@ def build_notion_decision_message(kind, tool_input, rationale="", session_tag=""
     rationale_block = f"\n\n{html_escape(rationale)}" if rationale else ""
 
     if kind == "character_proposal":
-        props = (tool_input.get("pages") or [{}])[0].get("properties", {}) or {}
-        name = _prop_text(_first_present(props, "Name", "Title") or "a new character")
+        props = _extract_properties(tool_input) or tool_input
+        name = _prop_text(_get_ci(props, "Name", "Title") or "a new character")
         details = "\n".join(
             f"  • <b>{html_escape(k)}:</b> {html_escape(_prop_text(v))}"
-            for k, v in props.items() if k not in ("Name", "Title") and v)
+            for k, v in props.items()
+            if isinstance(k, str) and k.lower() not in ("name", "title") and v)
         details_block = f"\n\n{details}" if details and not rationale else ""
         header = f"🐾 <b>New character proposed: {html_escape(name)}</b>{tag}"
         return header + rationale_block + details_block, None
 
     if kind == "status_decision":
-        props = tool_input.get("properties") or {}
-        status = _prop_text(_first_present(props, "Status") or "?")
+        props = _extract_properties(tool_input) or tool_input
+        status = _prop_text(_get_ci(props, "Status") or "?")
         header = f"📋 <b>Status change requested → {html_escape(status)}</b>{tag}"
         return header + rationale_block, None
 
     if kind == "image_ready":
-        props = tool_input.get("properties") or {}
-        image_val = _first_present(props, "Image", "Cover", "Image URL")
-        image_url = image_val if isinstance(image_val, str) else _prop_text(image_val)
-        status = props.get("Status")
+        props = _extract_properties(tool_input) or tool_input
+        image_val = _get_ci(props, "Image", "Cover", "Image URL", "Files")
+        image_url = _extract_url(image_val)
+        status = _get_ci(props, "Status")
         status_line = f"\n\n<b>Status →</b> {html_escape(_prop_text(status))}" if status else ""
         header = f"🎨 <b>Character image ready</b>{tag}"
         text = header + rationale_block + status_line
-        is_url = isinstance(image_url, str) and image_url.startswith("http")
-        return text, (image_url if is_url else None)
+        return text, image_url
 
     if kind == "content_edit":
-        body = _first_present(tool_input, "command", "content", "markdown", "children")
+        body = _get_ci(tool_input, "command", "content", "markdown", "children",
+                       "body", "page_content")
         body_text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False, indent=2)
         header = f"📖 <b>Lore update proposed</b>{tag}"
         body_block = (f"\n\n{html_escape(smart_truncate(body_text, 2500))}"
@@ -372,9 +475,13 @@ def handle_notion_decision(ch, state, kind, tool_name, tool_input,
     """
     rationale = _rationale_from_transcript(transcript_path)
     text, image_url = build_notion_decision_message(kind, tool_input, rationale, session_tag)
-    text = smart_truncate(text, 4090, marker="\n\n<i>…truncated</i>")
-    show_more = bool(transcript_path) and cfg.get("context_turns", 3) > 0
     is_photo = bool(image_url)
+    # Telegram's photo-caption limit (1024 chars) is much smaller than the
+    # text-message limit (4096) — truncating to the text limit here would
+    # leave the caption itself rejected with another 400 Bad Request.
+    caption_limit = 1024 if is_photo else 4090
+    text = smart_truncate(text, caption_limit, marker="\n\n<i>…truncated</i>")
+    show_more = bool(transcript_path) and cfg.get("context_turns", 3) > 0
     buttons = build_decision_buttons(show_more=show_more)
     short_label = _DECISION_SHORT_LABELS.get(kind, tool_name)
 
@@ -661,6 +768,8 @@ def main():
     _log(f"ESCALATING: {tool_name} / {tool_display[:50]}")
 
     notion_kind = classify_notion_write(tool_name, tool_input)
+    _log(f"NOTION CLASSIFY: tool_name={tool_name!r} kind={notion_kind!r} "
+        f"input_keys={sorted(tool_input.keys()) if isinstance(tool_input, dict) else type(tool_input).__name__}")
 
     if tool_name == "AskUserQuestion":
         try:

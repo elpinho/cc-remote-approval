@@ -5,7 +5,9 @@ All Telegram-specific logic lives here and in poll.py.
 Hooks never import from this module directly — they use the Channel interface.
 """
 import json
+import urllib.error
 import urllib.request
+import uuid
 
 from utils.channel import Channel
 
@@ -22,6 +24,45 @@ def tg_request(token, method, data=None):
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _http_error_detail(e):
+    """Telegram's error responses carry a useful "description" field in the
+    JSON body (e.g. "Bad Request: failed to get HTTP URL content") — urllib's
+    HTTPError.__str__() only gives the bare status line ("HTTP Error 400: Bad
+    Request"), which is nearly useless for diagnosing *why*. Best-effort: the
+    body can only be read once, so callers get this instead of raw access."""
+    try:
+        body = e.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(body).get("description", body)
+        except json.JSONDecodeError:
+            return body
+    except Exception:
+        return str(e)
+
+
+def _encode_multipart(fields, files):
+    """Minimal stdlib multipart/form-data encoder — no third-party deps per
+    this plugin's coding standards. `fields` is a str->str dict, `files` is
+    name -> (filename, bytes, content_type)."""
+    boundary = uuid.uuid4().hex
+    lines = []
+    for name, value in fields.items():
+        lines.append(f"--{boundary}".encode())
+        lines.append(f'Content-Disposition: form-data; name="{name}"'.encode())
+        lines.append(b"")
+        lines.append(str(value).encode("utf-8"))
+    for name, (filename, content, content_type) in files.items():
+        lines.append(f"--{boundary}".encode())
+        lines.append(
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"'.encode())
+        lines.append(f"Content-Type: {content_type}".encode())
+        lines.append(b"")
+        lines.append(content)
+    lines.append(f"--{boundary}--".encode())
+    lines.append(b"")
+    return b"\r\n".join(lines), f"multipart/form-data; boundary={boundary}"
 
 
 class TelegramChannel(Channel):
@@ -73,14 +114,60 @@ class TelegramChannel(Channel):
             pass
 
     def send_photo(self, photo_url, caption="", buttons=None, parse_mode="HTML"):
-        """Send a photo by URL with an optional caption and inline buttons.
-        Same error-propagation contract as send_message — the caller decides
-        whether to log and bail out on failure."""
+        """Send a photo with an optional caption and inline buttons.
+
+        Tries Telegram's URL-based sendPhoto first (cheap — Telegram fetches
+        the URL server-side). Many signed/proxied CDN URLs (Recraft's
+        included) fail that server-side fetch with a bare "400 Bad Request"
+        and no useful detail from urllib's HTTPError, even though the URL is
+        perfectly fetchable from here. On that failure, falls back to
+        downloading the image ourselves and uploading the bytes directly via
+        multipart/form-data — our network path to the URL may work even when
+        Telegram's does not.
+
+        Same error-propagation contract as send_message: raises on failure
+        of BOTH paths so the caller can log and decide what to do."""
         data = {"chat_id": self.chat_id, "photo": photo_url,
                 "caption": caption, "parse_mode": parse_mode}
         if buttons:
             data["reply_markup"] = {"inline_keyboard": buttons}
-        result = self._send("sendPhoto", data)
+        try:
+            result = self._send("sendPhoto", data)
+            return result["result"]["message_id"]
+        except urllib.error.HTTPError as e:
+            url_error = _http_error_detail(e)
+            return self._send_photo_upload(photo_url, caption, buttons, parse_mode, url_error)
+
+    def _send_photo_upload(self, photo_url, caption, buttons, parse_mode, url_error):
+        """Fallback for send_photo: download the image ourselves, then
+        upload the bytes to Telegram via multipart/form-data instead of
+        asking Telegram to fetch the URL itself."""
+        try:
+            req = urllib.request.Request(
+                photo_url, headers={"User-Agent": "Mozilla/5.0 (compatible; cc-remote-approval)"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                photo_bytes = resp.read()
+        except Exception as e:
+            raise RuntimeError(
+                f"sendPhoto by URL failed ({url_error}); "
+                f"download-and-upload fallback also failed to fetch the image: {e}") from e
+
+        fields = {"chat_id": str(self.chat_id), "caption": caption, "parse_mode": parse_mode}
+        if buttons:
+            fields["reply_markup"] = json.dumps({"inline_keyboard": buttons})
+        files = {"photo": ("photo.jpg", photo_bytes, "application/octet-stream")}
+        body, content_type = _encode_multipart(fields, files)
+
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendPhoto"
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": content_type}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(
+                f"sendPhoto by URL failed ({url_error}); "
+                f"upload fallback also failed: {_http_error_detail(e)}") from e
         return result["result"]["message_id"]
 
     def edit_caption(self, msg_id, caption, buttons=None, parse_mode="HTML"):

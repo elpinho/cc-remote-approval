@@ -245,6 +245,94 @@ class TestTelegramSendMessageErrors:
         ch.edit_buttons(100, [])           # must not raise
 
 
+class TestTelegramSendPhoto:
+    """send_photo tries Telegram's URL-based sendPhoto first, then falls
+    back to downloading + multipart-uploading the image if Telegram's
+    server-side fetch of the URL fails (real-world case: Recraft's
+    signed/proxied CDN URLs return 400 Bad Request from sendPhoto by URL)."""
+
+    def _http_error(self, code=400, body=b'{"description": "Bad Request: failed to get HTTP URL content"}'):
+        import io
+        import urllib.error
+        return urllib.error.HTTPError(
+            "https://api.telegram.org/x", code, "Bad Request", {}, io.BytesIO(body))
+
+    def test_send_photo_succeeds_via_url_without_fallback(self, monkeypatch):
+        import channels.telegram.client as tg_client
+        calls = []
+
+        def fake_request(token, method, data=None):
+            calls.append((method, data))
+            return {"ok": True, "result": {"message_id": 55}}
+
+        monkeypatch.setattr(tg_client, "tg_request", fake_request)
+        ch = tg_client.TelegramChannel("tok", "123")
+        msg_id = ch.send_photo("https://example.com/a.png", caption="hi")
+
+        assert msg_id == 55
+        assert calls == [("sendPhoto", {
+            "chat_id": "123", "photo": "https://example.com/a.png",
+            "caption": "hi", "parse_mode": "HTML"})]
+
+    def test_send_photo_falls_back_to_upload_on_400(self, monkeypatch):
+        import channels.telegram.client as tg_client
+        import urllib.request
+
+        def failing_url_send(token, method, data=None):
+            raise self._http_error()
+
+        monkeypatch.setattr(tg_client, "tg_request", failing_url_send)
+
+        download_calls = []
+        upload_calls = []
+
+        class _FakeResp:
+            def __init__(self, body):
+                self._body = body
+            def read(self):
+                return self._body
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else req
+            if "api.telegram.org" in url:
+                upload_calls.append(req)
+                return _FakeResp(json.dumps({"ok": True, "result": {"message_id": 77}}).encode())
+            download_calls.append(url)
+            return _FakeResp(b"fake-image-bytes")
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        ch = tg_client.TelegramChannel("tok", "123")
+        msg_id = ch.send_photo("https://cdn.example.com/proxied.png", caption="a photo",
+                               buttons=[[{"text": "OK", "callback_data": "ok"}]])
+
+        assert msg_id == 77
+        assert len(download_calls) == 1
+        assert download_calls[0] == "https://cdn.example.com/proxied.png"
+        assert len(upload_calls) == 1
+        assert upload_calls[0].get_header("Content-type", "").startswith("multipart/form-data")
+
+    def test_send_photo_raises_combined_error_if_download_also_fails(self, monkeypatch):
+        import channels.telegram.client as tg_client
+        import urllib.request
+
+        def failing_url_send(token, method, data=None):
+            raise self._http_error()
+
+        def failing_download(req, timeout=None):
+            raise RuntimeError("connection refused")
+
+        monkeypatch.setattr(tg_client, "tg_request", failing_url_send)
+        monkeypatch.setattr(urllib.request, "urlopen", failing_download)
+        ch = tg_client.TelegramChannel("tok", "123")
+
+        with pytest.raises(RuntimeError, match="failed to get HTTP URL content"):
+            ch.send_photo("https://cdn.example.com/proxied.png", caption="x")
+
+
 class TestTelegramDeleteMessage:
     """TelegramChannel.delete_message calls deleteMessage with the right args."""
 

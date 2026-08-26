@@ -1693,3 +1693,139 @@ class TestStopHookConfig:
         from utils.common import DEFAULTS
         assert DEFAULTS["stop_wait_seconds"] == 180
 
+
+
+class TestClassifyNotionWrite:
+    """classify_notion_write must tolerate several plausible Notion MCP /
+    --permission-prompt-tool wire shapes, since the real format is
+    undocumented upstream — and must never misclassify unrelated tools."""
+
+    def test_flat_character_proposal(self):
+        from permission_request import classify_notion_write
+        kind = classify_notion_write("mcp__notion__notion-create-pages", {
+            "pages": [{"properties": {"Name": "Bramblefin", "Region": ["Rafters"]}}]
+        })
+        assert kind == "character_proposal"
+
+    def test_character_proposal_via_children_wrapper(self):
+        from permission_request import classify_notion_write
+        kind = classify_notion_write("mcp__notion__notion-create-pages", {
+            "children": [{"properties": {"Name": "Bramblefin", "Creature type": "Eel"}}]
+        })
+        assert kind == "character_proposal"
+
+    def test_character_proposal_via_single_page_object(self):
+        from permission_request import classify_notion_write
+        kind = classify_notion_write("mcp__notion__notion-create-pages", {
+            "page": {"properties": {"Title": "Bramblefin", "Personality traits": "stubborn"}}
+        })
+        assert kind == "character_proposal"
+
+    def test_create_pages_tool_name_without_doubled_prefix(self):
+        from permission_request import classify_notion_write
+        kind = classify_notion_write("mcp__notion__create-pages", {
+            "pages": [{"properties": {"Name": "Bramblefin", "Region": ["Rafters"]}}]
+        })
+        assert kind == "character_proposal"
+
+    def test_status_decision_flat(self):
+        from permission_request import classify_notion_write
+        kind = classify_notion_write("mcp__notion__notion-update-page", {
+            "page_id": "abc", "properties": {"Status": "Approved"}
+        })
+        assert kind == "status_decision"
+
+    def test_status_decision_nested_notion_rest_shape(self):
+        from permission_request import classify_notion_write
+        kind = classify_notion_write("mcp__notion__notion-update-page", {
+            "page_id": "abc",
+            "properties": {"Status": {"type": "status", "status": {"name": "Approved"}}},
+        })
+        assert kind == "status_decision"
+
+    def test_image_ready_takes_priority_over_status(self):
+        from permission_request import classify_notion_write
+        kind = classify_notion_write("mcp__notion__notion-update-page", {
+            "properties": {
+                "Image": "https://example.com/art.png",
+                "Status": "Designed",
+            }
+        })
+        assert kind == "image_ready"
+
+    def test_image_ready_nested_files_shape(self):
+        from permission_request import classify_notion_write
+        kind = classify_notion_write("mcp__notion__notion-update-page", {
+            "properties": {
+                "Image": {"type": "files", "files": [
+                    {"name": "art.png", "external": {"url": "https://example.com/art.png"}}
+                ]},
+            }
+        })
+        assert kind == "image_ready"
+
+    def test_content_edit_alternate_key_names(self):
+        from permission_request import classify_notion_write
+        for key in ("command", "content", "markdown", "children", "body", "page_content"):
+            kind = classify_notion_write("mcp__notion__notion-update-page",
+                                         {"page_id": "abc", key: "some lore text"})
+            assert kind == "content_edit", f"key={key!r} should classify as content_edit"
+
+    def test_no_properties_falls_back_to_generic(self):
+        from permission_request import classify_notion_write
+        assert classify_notion_write("mcp__notion__notion-update-page", {"page_id": "abc"}) is None
+
+    def test_unrelated_bash_call_never_matches(self):
+        from permission_request import classify_notion_write
+        assert classify_notion_write("Bash", {"command": "ls -la"}) is None
+
+    def test_unrelated_mcp_call_never_matches(self):
+        from permission_request import classify_notion_write
+        assert classify_notion_write("mcp__printful__printful_create_order", {
+            "Name": "x", "Region": "y",
+        }) is None
+
+    def test_non_dict_tool_input_never_raises(self):
+        from permission_request import classify_notion_write
+        assert classify_notion_write("mcp__notion__notion-update-page", None) is None
+        assert classify_notion_write("mcp__notion__notion-update-page", "not a dict") is None
+
+    def test_single_matching_key_is_not_enough_for_proposal(self):
+        from permission_request import classify_notion_write
+        kind = classify_notion_write("mcp__notion__notion-create-pages", {
+            "pages": [{"properties": {"Name": "Bramblefin"}}]
+        })
+        assert kind is None
+
+
+class TestBuildNotionDecisionMessage:
+    """The message builder must use the same tolerant extraction as the
+    classifier so a classified call always renders something useful."""
+
+    def test_image_ready_extracts_nested_url_for_photo(self):
+        from permission_request import build_notion_decision_message
+        text, image_url = build_notion_decision_message("image_ready", {
+            "properties": {
+                "Image": {"type": "files", "files": [
+                    {"name": "art.png", "external": {"url": "https://example.com/art.png"}}
+                ]},
+            }
+        })
+        assert image_url == "https://example.com/art.png"
+        assert "Character image ready" in text
+
+    def test_status_decision_renders_nested_status_name(self):
+        from permission_request import build_notion_decision_message
+        text, image_url = build_notion_decision_message("status_decision", {
+            "properties": {"Status": {"type": "status", "status": {"name": "Approved"}}}
+        })
+        assert image_url is None
+        assert "Approved" in text
+
+    def test_character_proposal_renders_name_from_children_wrapper(self):
+        from permission_request import build_notion_decision_message
+        text, image_url = build_notion_decision_message("character_proposal", {
+            "children": [{"properties": {"Name": "Bramblefin", "Region": ["Rafters"]}}]
+        })
+        assert "Bramblefin" in text
+        assert image_url is None
