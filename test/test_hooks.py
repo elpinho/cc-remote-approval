@@ -1802,7 +1802,12 @@ class TestBuildNotionDecisionMessage:
     """The message builder must use the same tolerant extraction as the
     classifier so a classified call always renders something useful."""
 
-    def test_image_ready_extracts_nested_url_for_photo(self):
+    def test_image_ready_links_nested_url_but_stays_text_only(self):
+        """image_ready never returns a photo URL: the Notion `Image` property
+        is often a source asset (e.g. Recraft's SVG) that Telegram's
+        sendPhoto rejects outright. It's linked in the text instead, and any
+        actual photo preview is expected to have already happened via a
+        separate pre-approval step that uploads real image bytes."""
         from permission_request import build_notion_decision_message
         text, image_url = build_notion_decision_message("image_ready", {
             "properties": {
@@ -1811,7 +1816,8 @@ class TestBuildNotionDecisionMessage:
                 ]},
             }
         })
-        assert image_url == "https://example.com/art.png"
+        assert image_url is None
+        assert "https://example.com/art.png" in text
         assert "Character image ready" in text
 
     def test_status_decision_renders_nested_status_name(self):

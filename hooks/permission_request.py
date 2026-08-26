@@ -409,14 +409,23 @@ def build_notion_decision_message(kind, tool_input, rationale="", session_tag=""
         return header + rationale_block, None
 
     if kind == "image_ready":
+        # Deliberately text-only, never a photo: this preview is built from
+        # whatever URL is in the Notion `Image` property, which for this
+        # project is Recraft's hosted *source* asset — often SVG, which
+        # Telegram's sendPhoto rejects (it only accepts JPEG/PNG/GIF/WEBP).
+        # Both the URL-fetch and download-and-reupload paths fail on that,
+        # and previously did so silently. The real image preview already
+        # happens earlier via pre_approve.py, which uploads the actual local
+        # raster PNG directly — this gate just needs to confirm the write.
         props = _extract_properties(tool_input) or tool_input
         image_val = _get_ci(props, "Image", "Cover", "Image URL", "Files")
         image_url = _extract_url(image_val)
         status = _get_ci(props, "Status")
         status_line = f"\n\n<b>Status →</b> {html_escape(_prop_text(status))}" if status else ""
+        link_line = f"\n\n<a href=\"{html_escape(image_url)}\">Image asset</a>" if image_url else ""
         header = f"🎨 <b>Character image ready</b>{tag}"
-        text = header + rationale_block + status_line
-        return text, image_url
+        text = header + rationale_block + status_line + link_line
+        return text, None
 
     if kind == "content_edit":
         body = _get_ci(tool_input, "command", "content", "markdown", "children",
