@@ -8,11 +8,12 @@ import os
 import signal
 import sys
 import time
+import traceback
 
 from utils.common import (load_config, html_escape, make_logger,
                      mask_secrets, check_local_response, format_context_lines,
                      format_context_block, smart_truncate, POLL_TIMEOUT_SECONDS,
-                     send_full_context, send_full_tool,
+                     send_full_context, send_full_tool, extract_last_messages,
                      session_tag as common_session_tag)
 from utils.channel import create_channel
 
@@ -378,10 +379,19 @@ def _rationale_from_transcript(transcript_path, max_chars=3000):
     tool_input fields alone via build_notion_decision_message()."""
     if not transcript_path:
         return ""
-    msgs = extract_last_messages(transcript_path, max_messages=1, max_chars=None, full_scan=True)
-    if not msgs or msgs[-1]["role"] != "assistant":
+    # The rationale is a nice-to-have on the preview: a transcript that is
+    # missing, truncated, or shaped unexpectedly must degrade to "no
+    # rationale", never take down the approval gate itself. Failing here
+    # used to crash the hook before it sent anything, which Claude Code
+    # reads as an outright denial.
+    try:
+        msgs = extract_last_messages(transcript_path, max_messages=1, max_chars=None, full_scan=True)
+        if not msgs or msgs[-1]["role"] != "assistant":
+            return ""
+        return smart_truncate(mask_secrets(msgs[-1]["text"]), max_chars)
+    except Exception as e:
+        _log(f"RATIONALE UNAVAILABLE (continuing without it): {e!r}")
         return ""
-    return smart_truncate(mask_secrets(msgs[-1]["text"]), max_chars)
 
 
 def build_notion_decision_message(kind, tool_input, rationale="", session_tag=""):
@@ -664,6 +674,46 @@ def respond_deny(message=""):
 
 # ---------------------------------------------------------------- main
 
+# Populated by main() so the top-level crash guard can reach the channel and
+# the tool name after an unhandled exception has unwound main()'s frame.
+_LAST_STATE = {}
+
+
+def _fail_loud(exc):
+    """Turn an unhandled hook crash into a *distinguishable* denial.
+
+    Claude Code treats a hook that exits non-zero without writing a decision
+    as a plain permission denial — byte-identical, from the calling agent's
+    point of view, to the reviewer tapping Cancel. That is exactly how a
+    missing import in this file silently killed two production Notion writes
+    on 2026-08-27: the agent reported "denied", the operator never saw a
+    Telegram message, and nothing in the run said the gate had broken.
+
+    So on a crash: log the traceback, alert the channel out-of-band, and emit
+    an explicit deny whose message marks it as a system fault rather than a
+    human decision."""
+    _log(f"CRASH: {exc!r}\n{traceback.format_exc()}")
+
+    state = _LAST_STATE.get("state") or {}
+    ch = state.get("ch")
+    tool_name = state.get("tool_name", "?")
+    if ch is not None:
+        try:
+            ch.send_message(
+                "🛑 <b>Approval system error</b>\n\n"
+                f"<pre>{html_escape(f'{type(exc).__name__}: {exc}')}</pre>\n\n"
+                f"The gated call <code>{html_escape(tool_name)}</code> was auto-denied "
+                "because this hook crashed. It was <b>not</b> reviewed by anyone.")
+        except Exception as send_exc:
+            _log(f"CRASH ALERT SEND FAILED: {send_exc!r}")
+
+    respond_deny(
+        "APPROVAL-SYSTEM ERROR: the remote-approval hook crashed before this call "
+        f"could be reviewed ({type(exc).__name__}: {exc}). This is NOT a reviewer "
+        "decision and NOT a denial. Do not revise and retry. Stop this stage and "
+        "report the approval system as broken.")
+
+
 def main():
 
     # State shared with signal handler and atexit.
@@ -672,6 +722,7 @@ def main():
     # "Reply to this message" lock on an already-resolved request.
     state = {"ch": None, "msg_id": None, "tool_name": "", "tool_display": "",
              "resolved": False, "prompt_ids": [], "is_photo": False}
+    _LAST_STATE["state"] = state
 
     def _cleanup_prompts():
         if not state["ch"]:
@@ -888,4 +939,13 @@ def main():
             respond_deny("User denied via Telegram")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as _exc:
+        _fail_loud(_exc)
+        # Exit 0 deliberately: a non-zero exit makes Claude Code discard our
+        # stdout and substitute its own generic denial, which is the silent
+        # failure this guard exists to prevent.
+        sys.exit(0)
