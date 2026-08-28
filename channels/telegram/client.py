@@ -6,11 +6,19 @@ Hooks never import from this module directly — they use the Channel interface.
 """
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
 from utils.channel import Channel
 
+# Telegram's sendPhoto only accepts JPEG/PNG/GIF/WEBP. Recraft (and other
+# asset hosts this pipeline points at) often serve SVG, which fails both the
+# URL-fetch and the raw download-and-upload path with an opaque 400. This
+# proxy is format-agnostic on input and always returns a PNG, so routing the
+# fallback download through it turns "unsupported format" into a non-issue
+# without every caller needing to know or care what format a given URL is.
+IMAGE_PROXY_URL = "https://pngit.foxsgrno1.workers.dev/?url="
 
 
 def tg_request(token, method, data=None):
@@ -141,21 +149,27 @@ class TelegramChannel(Channel):
     def _send_photo_upload(self, photo_url, caption, buttons, parse_mode, url_error):
         """Fallback for send_photo: download the image ourselves, then
         upload the bytes to Telegram via multipart/form-data instead of
-        asking Telegram to fetch the URL itself."""
+        asking Telegram to fetch the URL itself.
+
+        Downloads via IMAGE_PROXY_URL rather than photo_url directly — the
+        proxy detects the source format and always returns a PNG, so this
+        one hop also fixes the "Telegram rejects the format" failure mode
+        (e.g. SVG), not just the "Telegram can't reach this URL" one."""
+        proxied_url = IMAGE_PROXY_URL + urllib.parse.quote(photo_url, safe="")
         try:
             req = urllib.request.Request(
-                photo_url, headers={"User-Agent": "Mozilla/5.0 (compatible; cc-remote-approval)"})
+                proxied_url, headers={"User-Agent": "Mozilla/5.0 (compatible; cc-remote-approval)"})
             with urllib.request.urlopen(req, timeout=20) as resp:
                 photo_bytes = resp.read()
         except Exception as e:
             raise RuntimeError(
                 f"sendPhoto by URL failed ({url_error}); "
-                f"download-and-upload fallback also failed to fetch the image: {e}") from e
+                f"download-and-upload fallback also failed to fetch/convert the image: {e}") from e
 
         fields = {"chat_id": str(self.chat_id), "caption": caption, "parse_mode": parse_mode}
         if buttons:
             fields["reply_markup"] = json.dumps({"inline_keyboard": buttons})
-        files = {"photo": ("photo.jpg", photo_bytes, "application/octet-stream")}
+        files = {"photo": ("photo.png", photo_bytes, "application/octet-stream")}
         body, content_type = _encode_multipart(fields, files)
 
         url = f"https://api.telegram.org/bot{self.bot_token}/sendPhoto"

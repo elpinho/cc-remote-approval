@@ -311,7 +311,9 @@ class TestTelegramSendPhoto:
 
         assert msg_id == 77
         assert len(download_calls) == 1
-        assert download_calls[0] == "https://cdn.example.com/proxied.png"
+        assert download_calls[0] == (
+            "https://pngit.foxsgrno1.workers.dev/?url="
+            "https%3A%2F%2Fcdn.example.com%2Fproxied.png")
         assert len(upload_calls) == 1
         assert upload_calls[0].get_header("Content-type", "").startswith("multipart/form-data")
 
